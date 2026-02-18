@@ -1,0 +1,806 @@
+/*
+  AUDIO SLAVE — M4 UI (OLED + Modulino Knob/Buttons/Pixels)
+  --------------------------------------------------------
+  FINAL PRESENTATION UI:
+    - Knob TWIST cycles modes (endless)
+    - 5s cinematic transition per mode change
+    - End of each transition: BIG "AUDIO / SLAVE" punch (unique per mode)
+    - Audio on M7 is NOT touched during the transition; mode is committed AFTER punch
+    - Pixels: spectrum brightness + ping/pong comet so it never looks static
+    - Buttons A/B/C: send triggers to M7 (single/double/triple/long)
+
+  OLED address: 0x3D
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <RPC.h>
+#include <Arduino_Modulino.h>
+#include <math.h>
+
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#ifdef WHITE
+  #undef WHITE
+#endif
+#ifdef BLACK
+  #undef BLACK
+#endif
+
+// ---------------- OLED ----------------
+#define OLED_ADDR 0x3D
+#define OLED_W 128
+#define OLED_H 64
+Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire, -1);
+
+// ---------------- Modulino ----------------
+ModulinoKnob    knob;
+ModulinoButtons btns;
+ModulinoPixels  pixels;
+
+// ---------------- UI State ----------------
+static uint8_t mode = 0;                 // 0..3 (ACTIVE on M7)
+static uint32_t modeChangeMs = 0;
+
+static uint32_t lastFrameMs = 0;
+static uint32_t lastPotsMs  = 0;
+static uint32_t lastBandsMs = 0;
+static uint32_t lastInputMs = 0;
+static uint32_t lastModeStepMs = 0;
+
+static int   uiDial = 50;                // 0..100
+static float uiEnergy = 0.5f;
+static float burstA=0, burstB=0, burstC=0, burstK=0;
+
+// Pots (smoothed-ish)
+static uint16_t a0=0,a1=0,a4=0,a5=0,a6=0;
+static float p0=0,p1=0,p2=0,p3=0,p4=0;
+
+// Spectrum
+static uint8_t bandRaw[8] = {0};         // 0..15
+static float   bandSm[8]  = {0};         // smoothed 0..15
+
+// ---------------- Transition State ----------------
+static bool     inTrans = false;
+static uint8_t  transFrom = 0;
+static uint8_t  transTo   = 0;
+static uint32_t transStartMs = 0;
+
+static const uint32_t TRANS_MS = 5000;   // 5 seconds
+static const uint32_t PUNCH_MS = 650;    // last 650ms = AUDIO/SLAVE punch
+
+// ---------------- Helpers ----------------
+static inline float clampf(float x, float lo, float hi){ return (x<lo)?lo:(x>hi)?hi:x; }
+static inline float lerpf(float a, float b, float t){ return a + (b-a)*t; }
+static inline uint8_t u8clamp(int v){ return (v<0)?0:(v>255)?255:(uint8_t)v; }
+
+static inline uint8_t bandAt(uint32_t packed, int i){
+  return (packed >> (i*4)) & 0x0F;
+}
+static inline void kickBurst(float &b, float amt){
+  b = clampf(b + amt, 0.0f, 1.25f);
+}
+
+// classic color wheel
+static inline void hsvWheel(uint8_t wheelPos, uint8_t &r, uint8_t &g, uint8_t &b){
+  wheelPos = 255 - wheelPos;
+  if (wheelPos < 85) {
+    r = 255 - wheelPos * 3; g = 0; b = wheelPos * 3;
+  } else if (wheelPos < 170) {
+    wheelPos -= 85;
+    r = 0; g = wheelPos * 3; b = 255 - wheelPos * 3;
+  } else {
+    wheelPos -= 170;
+    r = wheelPos * 3; g = 255 - wheelPos * 3; b = 0;
+  }
+}
+
+// ---------------- Gesture (uint8_t events; compile-safe) ----------------
+static const uint8_t EVT_NONE   = 0;
+static const uint8_t EVT_SINGLE = 1;
+static const uint8_t EVT_DOUBLE = 2;
+static const uint8_t EVT_TRIPLE = 3;
+static const uint8_t EVT_LONG   = 4;
+
+struct Gesture {
+  bool lastDown = false;
+  bool longFired = false;
+  uint8_t clicks = 0;
+  uint32_t tDown = 0;
+  uint32_t tUp   = 0;
+
+  void update(bool down, uint32_t now, void (*emit)(uint8_t)){
+    static const uint32_t LONG_MS  = 550;
+    static const uint32_t MULTI_MS = 300;
+
+    if(down && !lastDown){
+      tDown = now;
+      longFired = false;
+    }
+    if(down && !longFired && (now - tDown) >= LONG_MS){
+      longFired = true;
+      clicks = 0;
+      if(emit) emit(EVT_LONG);
+    }
+    if(!down && lastDown){
+      if(!longFired){
+        clicks++;
+        tUp = now;
+      }
+    }
+    if(!down && clicks > 0 && (now - tUp) >= MULTI_MS){
+      if(emit){
+        if(clicks == 1) emit(EVT_SINGLE);
+        else if(clicks == 2) emit(EVT_DOUBLE);
+        else emit(EVT_TRIPLE);
+      }
+      clicks = 0;
+    }
+    lastDown = down;
+  }
+};
+
+static Gesture gKnob, gA, gB, gC;
+
+// ---------------- RPC helpers ----------------
+static inline void rpcSetModeImmediate(uint8_t m){
+  mode = (uint8_t)(m & 3);
+  modeChangeMs = millis();
+  RPC.call("setMode", (int)mode);
+}
+
+static inline void startTransitionTo(uint8_t newMode){
+  if(newMode == mode) return;
+  if(inTrans) return;
+
+  inTrans = true;
+  transFrom = mode;
+  transTo = newMode & 3;
+  transStartMs = millis();
+
+  kickBurst(burstK, 0.95f);
+}
+
+// ---------------- Button LEDs ----------------
+static inline void updateButtonLeds(uint32_t nowMs){
+  uint8_t showMode = inTrans ? transTo : mode;
+
+  bool A=false, B=false, C=false;
+  if(showMode == 0) A = true;
+  else if(showMode == 1) B = true;
+  else if(showMode == 2) C = true;
+  else {
+    uint32_t blink = inTrans ? 220 : 512;
+    A = ((nowMs / blink) & 1) != 0;
+  }
+
+  if(inTrans && showMode != 3){
+    uint32_t blink = 220;
+    bool on = ((nowMs / blink) & 1) != 0;
+    A = A && on; B = B && on; C = C && on;
+  }
+
+  btns.setLeds(A, B, C);
+}
+
+// ---------------- Event handlers ----------------
+static void onKnobEvt(uint8_t e){
+  // only long press used here: panic clear
+  if(e == EVT_LONG){
+    kickBurst(burstK, 1.25f);
+    RPC.call("trigger", 32);
+    inTrans = false; // cancel cinematic if needed
+  }
+}
+
+static void onAEvt(uint8_t e){
+  if(e == EVT_SINGLE){ kickBurst(burstA, 0.55f); RPC.call("trigger", 0); }
+  else if(e == EVT_DOUBLE){ kickBurst(burstA, 0.70f); RPC.call("trigger", 10); }
+  else if(e == EVT_TRIPLE){ kickBurst(burstA, 0.95f); RPC.call("trigger", 20); }
+  else if(e == EVT_LONG){ kickBurst(burstA, 1.10f); RPC.call("trigger", 22); }
+}
+static void onBEvt(uint8_t e){
+  if(e == EVT_SINGLE){ kickBurst(burstB, 0.55f); RPC.call("trigger", 1); }
+  else if(e == EVT_DOUBLE){ kickBurst(burstB, 0.70f); RPC.call("trigger", 11); }
+  else if(e == EVT_TRIPLE){ kickBurst(burstB, 0.95f); RPC.call("trigger", 21); }
+  else if(e == EVT_LONG){ kickBurst(burstB, 1.10f); RPC.call("trigger", 22); }
+}
+static void onCEvt(uint8_t e){
+  if(e == EVT_SINGLE){ kickBurst(burstC, 0.55f); RPC.call("trigger", 2); }
+  else if(e == EVT_DOUBLE){ kickBurst(burstC, 0.70f); RPC.call("trigger", 12); }
+  else if(e == EVT_TRIPLE){ kickBurst(burstC, 1.05f); RPC.call("trigger", 22); }
+  else if(e == EVT_LONG){ kickBurst(burstC, 1.25f); RPC.call("trigger", 32); }
+}
+
+// ---------------- Logo (ONLY text in normal mode frames) ----------------
+static void drawLogo(uint32_t t){
+  float spec = 0.0f;
+  for(int i=0;i<8;i++) spec += bandSm[i];
+  spec = clampf(spec / (8.0f*15.0f), 0.0f, 1.0f);
+
+  float e = clampf(0.15f + 0.55f*uiEnergy + 0.25f*(p4*p4) + 0.35f*spec, 0.0f, 1.25f);
+  e = clampf(e + 0.75f*burstK, 0.0f, 1.25f);
+
+  int jitterX = (int)(sinf(t * 0.017f) * (1.0f + 3.0f*e));
+  int jitterY = (int)(sinf(t * 0.011f) * (0.5f + 2.0f*e));
+
+  display.setTextWrap(false);
+  display.setTextColor(SSD1306_WHITE);
+
+  const char *txt = "AUDIO SLAVE";
+  display.setTextSize(1);
+
+  int16_t x1,y1; uint16_t w,h;
+  display.getTextBounds(txt, 0, 0, &x1, &y1, &w, &h);
+  int x = (OLED_W - (int)w) / 2 + jitterX;
+  int y = 2 + jitterY;
+
+  display.setCursor(x, y);
+  display.print(txt);
+
+  int ul = 11;
+  int seg = 14 + (int)(22.0f * e);
+  int off = (t / 18) % OLED_W;
+  for(int i=0;i<OLED_W; i+=seg){
+    int xx = (i + off) % OLED_W;
+    display.drawFastHLine(xx, ul, seg/2, SSD1306_WHITE);
+  }
+
+  if((t & 127) < (uint32_t)(6 + 22*e)){
+    int gy = 2 + (int)(random(0,10));
+    display.fillRect(0, gy, OLED_W, 1, SSD1306_BLACK);
+    display.drawFastHLine(0, gy, OLED_W, SSD1306_WHITE);
+  }
+}
+
+// ---------------- 4 base mode visuals ----------------
+static void mode0_Lamentations(uint32_t t){
+  float mot = p2;
+  float wid = p3;
+
+  int vanX = 64 + (int)(sinf(t*0.002f) * (6 + 10*uiEnergy));
+  int vanY = 16 + (int)(sinf(t*0.0016f) * 3);
+
+  for(int i=-56;i<=184;i+=14){
+    display.drawLine(vanX, vanY, i, 63, SSD1306_WHITE);
+  }
+
+  int sp = 2 + (int)(10.0f*mot);
+  if(sp < 1) sp = 1;
+  int phase = (int)((t / (uint32_t)sp) % 16);
+  for(int j=0;j<6;j++){
+    int y = 24 + j*8 + phase;
+    if(y < 64) display.drawFastHLine(0, y, OLED_W, SSD1306_WHITE);
+  }
+
+  float low = (bandSm[0] + bandSm[1]) / 30.0f;
+  int w = 6 + (int)(40.0f * low * (0.35f + 0.65f*wid));
+  display.fillTriangle(64, 22, 64-w, 63, 64+w, 63, SSD1306_WHITE);
+
+  int drops = 6 + (int)(10.0f*mot);
+  for(int i=0;i<drops;i++){
+    int x = (i*21 + (t/7)) % OLED_W;
+    int y = (i*13 + (t/9)) % OLED_H;
+    int len = 3 + (int)(6.0f*(0.2f + 0.8f*low));
+    display.drawFastVLine(x, y, len, SSD1306_WHITE);
+  }
+
+  if(burstA > 0.2f){
+    int yy = 20 + (int)(random(0, 36));
+    display.drawFastHLine(0, yy, OLED_W, SSD1306_WHITE);
+  }
+}
+
+static void mode1_Hallucinations(uint32_t t){
+  float timb = p1;
+  float mot  = p2;
+
+  int cx = 64 + (int)(sinf(t*0.003f) * (10 + 18*timb));
+  int cy = 38 + (int)(cosf(t*0.0024f) * (6 + 12*mot));
+
+  for(int r=6; r<=30; r+=6){
+    int wob = (int)(sinf(t*0.006f + r*0.4f) * (1 + 3*timb));
+    display.drawCircle(cx, cy, r+wob, SSD1306_WHITE);
+  }
+
+  for(int i=0;i<10;i++){
+    float a = (t*0.004f) + i*0.45f;
+    int x = 64 + (int)(sinf(a* (1.0f + 2.0f*timb)) * 58);
+    int y = 36 + (int)(cosf(a* (1.4f + 1.8f*mot)) * 22);
+    display.drawPixel(x, y, SSD1306_WHITE);
+  }
+
+  float hi = (bandSm[6] + bandSm[7]) / 30.0f;
+  int sparks = (int)(4 + 20*hi);
+  for(int i=0;i<sparks;i++){
+    int x = random(0, OLED_W);
+    int y = random(12, OLED_H);
+    display.drawPixel(x, y, SSD1306_WHITE);
+  }
+
+  if(burstB > 0.2f){
+    int sx = (int)(t % OLED_W);
+    display.drawLine(sx, 12, sx-24, 63, SSD1306_WHITE);
+    display.drawLine(sx+1, 12, sx-23, 63, SSD1306_WHITE);
+  }
+}
+
+static void mode2_Incantations(uint32_t t){
+  float mot  = p2;
+  float wid  = p3;
+
+  int cx=64, cy=38;
+  float rot = t * (0.0020f + 0.0060f*mot);
+  int baseR = 10 + (int)(10.0f*wid);
+
+  display.drawCircle(cx, cy, baseR, SSD1306_WHITE);
+  display.drawCircle(cx, cy, baseR+8, SSD1306_WHITE);
+
+  for(int i=0;i<8;i++){
+    float a = rot + i*(6.2831853f/8.0f);
+    float b = bandSm[i] / 15.0f;
+    int r1 = baseR + 4;
+    int r2 = r1 + 10 + (int)(18.0f*b);
+    int x1 = cx + (int)(cosf(a)*r1);
+    int y1 = cy + (int)(sinf(a)*r1);
+    int x2 = cx + (int)(cosf(a)*r2);
+    int y2 = cy + (int)(sinf(a)*r2);
+    display.drawLine(x1,y1,x2,y2, SSD1306_WHITE);
+    display.drawPixel(x2,y2, SSD1306_WHITE);
+  }
+
+  int dust = 8 + (int)(18.0f*mot);
+  for(int i=0;i<dust;i++){
+    int x = (int)(cx + cosf(rot*1.7f + i)* (18 + (i%7)*3));
+    int y = (int)(cy + sinf(rot*1.4f + i)* (14 + (i%5)*4));
+    if(x>=0 && x<OLED_W && y>=12 && y<OLED_H) display.drawPixel(x,y,SSD1306_WHITE);
+  }
+
+  if(burstC > 0.2f){
+    display.drawCircle(cx, cy, 28, SSD1306_WHITE);
+    display.drawCircle(cx, cy, 29, SSD1306_WHITE);
+  }
+}
+
+static void mode3_Revelations(uint32_t t){
+  float timb = p1;
+  float mot  = p2;
+
+  int cx=64, cy=34;
+
+  int wob = (int)(sinf(t*0.010f) * (2 + 6*timb));
+  for(int r=8;r<=30;r+=7){
+    display.drawCircle(cx, cy, r+wob, SSD1306_WHITE);
+  }
+
+  float low = (bandSm[0] + bandSm[1]) / 30.0f;
+  int beamW = 6 + (int)(36.0f*low);
+  display.drawRoundRect(cx - beamW/2, 14, beamW, 50, 3, SSD1306_WHITE);
+  int innerW = beamW - 4; if(innerW < 1) innerW = 1;
+  display.fillRect(cx - beamW/2 + 2, 16, innerW, 46, SSD1306_BLACK);
+
+  int bolts = 1 + (int)(3.0f*mot) + (burstK>0.2f);
+  for(int b=0;b<bolts;b++){
+    int x = cx + random(-22, 22);
+    int y = 14 + random(0, 10);
+    for(int k=0;k<6;k++){
+      int nx = x + random(-10, 10);
+      int ny = y + random(4, 10);
+      display.drawLine(x,y,nx,ny, SSD1306_WHITE);
+      x=nx; y=ny;
+      if(y>63) break;
+    }
+  }
+
+  if((burstA + burstB + burstC) > 0.8f){
+    display.drawFastHLine(0, 22, OLED_W, SSD1306_WHITE);
+    display.drawFastHLine(0, 23, OLED_W, SSD1306_WHITE);
+  }
+}
+
+// ---------------- Transition effects ----------------
+static void drawWavyScan(uint32_t t, float amp, float spd, float freq){
+  for(int y=12; y<OLED_H; y+=3){
+    float s = sinf((y*freq) + (t*spd));
+    int off = (int)(s * amp);
+    int x0 = off;
+    int w  = OLED_W - abs(off);
+    if(w < 1) continue;
+    if(x0 < 0) x0 = 0;
+    display.drawFastHLine(x0, y, w, SSD1306_WHITE);
+  }
+}
+static void drawRings(uint32_t t, int cx, int cy, int r0, int r1, float spd){
+  int base = (int)((t * spd)) % 12;
+  for(int r=r0; r<=r1; r+=6){
+    int rr = r + base;
+    display.drawCircle(cx, cy, rr, SSD1306_WHITE);
+  }
+}
+
+// BIG punch at end: AUDIO/SLAVE (unique style per destination mode)
+static void drawAudioSlavePunch(uint32_t nowMs, uint8_t style, float k){
+  bool flash = ((nowMs >> 6) & 1) != 0;
+
+  if(flash){
+    display.fillRect(0,0,OLED_W,OLED_H, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK);
+  } else {
+    display.fillRect(0,0,OLED_W,OLED_H, SSD1306_BLACK);
+    display.setTextColor(SSD1306_WHITE);
+  }
+
+  // style back-effects (unique per transition)
+  if(style == 0){
+    int cx=64, cy=38;
+    int rr = 4 + (int)(50.0f * k);
+    display.drawCircle(cx, cy, rr, flash ? SSD1306_BLACK : SSD1306_WHITE);
+    display.drawCircle(cx, cy, rr+6, flash ? SSD1306_BLACK : SSD1306_WHITE);
+  } else if(style == 1){
+    int x = (int)(k * OLED_W);
+    display.drawLine(x, 0, x-46, 63, flash ? SSD1306_BLACK : SSD1306_WHITE);
+    display.drawLine(x+2, 0, x-44, 63, flash ? SSD1306_BLACK : SSD1306_WHITE);
+  } else if(style == 2){
+    int cx=64, cy=34;
+    for(int i=0;i<10;i++){
+      float a = (nowMs*0.011f) + i*(6.2831853f/10.0f);
+      int r1 = 8;
+      int r2 = 14 + (int)(32.0f*k);
+      int x1 = cx + (int)(cosf(a)*r1);
+      int y1 = cy + (int)(sinf(a)*r1);
+      int x2 = cx + (int)(cosf(a)*r2);
+      int y2 = cy + (int)(sinf(a)*r2);
+      display.drawLine(x1,y1,x2,y2, flash ? SSD1306_BLACK : SSD1306_WHITE);
+    }
+  } else {
+    int x = 18 + (int)(k*90);
+    int y = 10;
+    for(int i=0;i<7;i++){
+      int nx = x + random(-10,10);
+      int ny = y + random(6,12);
+      display.drawLine(x,y,nx,ny, flash ? SSD1306_BLACK : SSD1306_WHITE);
+      x=nx; y=ny;
+      if(y>63) break;
+    }
+  }
+
+  // Text block
+  display.setTextSize(2);
+  const char* L1 = "AUDIO";
+  const char* L2 = "SLAVE";
+
+  int16_t x1,y1; uint16_t w,h;
+  display.getTextBounds(L1, 0, 0, &x1, &y1, &w, &h);
+  int px = (OLED_W - (int)w) / 2;
+  int py = 16 - (int)(4.0f * sinf(k*3.14159f));
+
+  display.setCursor(px, py);
+  display.print(L1);
+
+  display.getTextBounds(L2, 0, 0, &x1, &y1, &w, &h);
+  px = (OLED_W - (int)w) / 2;
+  display.setCursor(px, py + 20);
+  display.print(L2);
+
+  if(k > 0.35f){
+    display.drawFastHLine(0, 12, OLED_W, flash ? SSD1306_BLACK : SSD1306_WHITE);
+    display.drawFastHLine(0, 54, OLED_W, flash ? SSD1306_BLACK : SSD1306_WHITE);
+  }
+}
+
+// Unique transitions by DESTINATION mode
+static void transitionTo0(uint32_t t, float u){
+  float amp = 6 + 18*(1.0f-u) + 10*uiEnergy;
+  drawWavyScan(t, amp, 0.010f, 0.24f);
+
+  int vanX = 64 + (int)(sinf(t*0.002f) * (10 + 10*(1.0f-u)));
+  int vanY = 16;
+  for(int i=-40;i<=168;i+=16){
+    display.drawLine(vanX, vanY, i, 63, SSD1306_WHITE);
+  }
+
+  int beams = 2 + (int)(6.0f * (bandSm[0]/15.0f));
+  for(int i=0;i<beams;i++){
+    int x = 64 + random(-20,20);
+    display.drawLine(x, 12, 64, 63, SSD1306_WHITE);
+  }
+}
+
+static void transitionTo1(uint32_t t, float u){
+  float amp = 8 + 20*(1.0f-u);
+  drawWavyScan(t, amp, 0.013f, 0.35f);
+
+  int cx = 64 + (int)(sinf(t*0.003f) * (10 + 10*u));
+  int cy = 36;
+  for(int r=6;r<=30;r+=6){
+    int wob = (int)(sinf(t*0.010f + r*0.5f) * (2 + 6*(1.0f-u)));
+    display.drawCircle(cx, cy, r+wob, SSD1306_WHITE);
+  }
+
+  int slices = 3 + (int)(5.0f*(1.0f-u));
+  for(int i=0;i<slices;i++){
+    int x = (int)((t*0.2f) + i*36) % OLED_W;
+    display.drawLine(x, 12, x-30, 63, SSD1306_WHITE);
+  }
+}
+
+static void transitionTo2(uint32_t t, float u){
+  int cx=64, cy=38;
+  float rot = t * 0.005f;
+  for(int i=0;i<12;i++){
+    float a = rot + i*(6.2831853f/12.0f);
+    float wob = sinf((t*0.012f) + i*0.7f);
+    int r1 = 10;
+    int r2 = 18 + (int)((28.0f*(1.0f-u)) + 10.0f*wob);
+    int x1 = cx + (int)(cosf(a)*r1);
+    int y1 = cy + (int)(sinf(a)*r1);
+    int x2 = cx + (int)(cosf(a)*r2);
+    int y2 = cy + (int)(sinf(a)*r2);
+    display.drawLine(x1,y1,x2,y2, SSD1306_WHITE);
+  }
+
+  for(int y=12;y<OLED_H;y+=4){
+    int off = (int)(sinf((y*0.22f) + (t*0.018f)) * (10 + 18*(1.0f-u)));
+    int x0 = 10 + off;
+    int x1 = 118 - off;
+    if(x0 < 0) x0 = 0;
+    if(x1 > 127) x1 = 127;
+    display.drawLine(x0, y, x1, y, SSD1306_WHITE);
+  }
+}
+
+static void transitionTo3(uint32_t t, float u){
+  drawWavyScan(t, 10 + 18*(1.0f-u), 0.016f, 0.28f);
+
+  int cx=64, cy=34;
+  drawRings(t, cx, cy, 6, 28, 0.06f);
+
+  int bolts = 1 + (int)(3.0f*(1.0f-u));
+  for(int b=0;b<bolts;b++){
+    int x = cx + random(-26,26);
+    int y = 12 + random(0,8);
+    for(int k=0;k<5;k++){
+      int nx = x + random(-10,10);
+      int ny = y + random(6,12);
+      display.drawLine(x,y,nx,ny, SSD1306_WHITE);
+      x=nx; y=ny;
+      if(y>63) break;
+    }
+  }
+}
+
+// ---------------- Frames ----------------
+static void drawTransitionFrame(uint32_t nowMs){
+  uint32_t dt = nowMs - transStartMs;
+
+  display.clearDisplay();
+
+  // subtle alive noise
+  int dots = 6 + (int)(18.0f * uiEnergy);
+  for(int i=0;i<dots;i++){
+    display.drawPixel(random(0, OLED_W), random(0, OLED_H), SSD1306_WHITE);
+  }
+
+  if(dt >= TRANS_MS){
+    inTrans = false;
+    rpcSetModeImmediate(transTo); // commit audio AFTER show
+    display.display();
+    return;
+  }
+
+  if(dt >= (TRANS_MS - PUNCH_MS)){
+    float k = (dt - (TRANS_MS - PUNCH_MS)) / (float)PUNCH_MS;
+    k = clampf(k, 0.0f, 1.0f);
+    drawAudioSlavePunch(nowMs, transTo, k);
+    display.display();
+    return;
+  }
+
+  float u = dt / (float)(TRANS_MS - PUNCH_MS);
+  u = clampf(u, 0.0f, 1.0f);
+
+  if(transTo == 0) transitionTo0(nowMs, u);
+  else if(transTo == 1) transitionTo1(nowMs, u);
+  else if(transTo == 2) transitionTo2(nowMs, u);
+  else transitionTo3(nowMs, u);
+
+  display.display();
+}
+
+static void drawModeFrame(uint32_t nowMs){
+  display.clearDisplay();
+
+  float nz = clampf(0.06f + 0.25f*uiEnergy + 0.25f*(p4*p4), 0.0f, 0.55f);
+  int dots = (int)(2 + 18*nz);
+  for(int i=0;i<dots;i++){
+    display.drawPixel(random(0, OLED_W), random(12, OLED_H), SSD1306_WHITE);
+  }
+
+  switch(mode){
+    case 0: mode0_Lamentations(nowMs); break;
+    case 1: mode1_Hallucinations(nowMs); break;
+    case 2: mode2_Incantations(nowMs); break;
+    default: mode3_Revelations(nowMs); break;
+  }
+
+  drawLogo(nowMs);
+  display.display();
+}
+
+// ---------------- Pixels: spectrum + ping/pong comet ----------------
+static void updatePixels(uint32_t nowMs){
+  static int head = 0;
+  static int dir = 1;
+  static uint32_t lastStep = 0;
+
+  uint32_t stepMs = 45 - (uint32_t)(25.0f * uiEnergy);
+  if(stepMs < 12) stepMs = 12;
+
+  if(nowMs - lastStep >= stepMs){
+    lastStep = nowMs;
+    head += dir;
+    if(head >= 7){ head = 7; dir = -1; }
+    else if(head <= 0){ head = 0; dir = 1; }
+  }
+
+  pixels.clear();
+
+  uint8_t baseHue = (uint8_t)(mode * 64 + (nowMs >> 3));
+
+  for(int i=0;i<8;i++){
+    float lv = bandSm[i];
+    float n = clampf(lv / 15.0f, 0.0f, 1.0f);
+    n = sqrtf(n);
+
+    int bright = (int)(6 + 82*n);
+    int dist = abs(i - head);
+    int cometAdd = (dist==0)? 35 : (dist==1? 18 : (dist==2? 8 : 0));
+    bright += cometAdd;
+    if(bright > 100) bright = 100;
+
+    uint8_t hue = (uint8_t)(baseHue + i*18 + (int)(burstK*30.0f));
+    uint8_t r,g,b;
+    hsvWheel(hue, r,g,b);
+
+    // mode palettes (mode 3: NOT mostly white)
+    if(mode == 0){
+      r = u8clamp((int)(r * 1.00f));
+      g = u8clamp((int)(g * 0.55f));
+      b = u8clamp((int)(b * 0.30f));
+    } else if(mode == 1){
+      r = u8clamp((int)(r * 0.55f));
+      g = u8clamp((int)(g * 0.95f));
+      b = u8clamp((int)(b * 1.00f));
+    } else if(mode == 2){
+      r = u8clamp((int)(r * 0.80f));
+      g = u8clamp((int)(g * 1.00f));
+      b = u8clamp((int)(b * 0.60f));
+    } else {
+      // mode 3: hot rainbow with brighter peaks (not white-washed)
+      float pk = clampf((bandSm[i] - 9.0f)/6.0f, 0.0f, 1.0f);
+      r = u8clamp((int)lerpf(r, 255, 0.30f + 0.40f*pk));
+      g = u8clamp((int)(g * (0.75f + 0.20f*pk)));
+      b = u8clamp((int)lerpf(b, 255, 0.20f + 0.35f*pk));
+    }
+
+    pixels.set(i, r, g, b, bright);
+  }
+
+  pixels.show();
+}
+
+// ---------------- Setup/Loop ----------------
+void setup(){
+  randomSeed((uint32_t)micros());
+
+  Wire.begin();
+  Wire.setClock(400000);
+
+  RPC.begin();
+
+  display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+  display.clearDisplay();
+  display.display();
+
+  Modulino.begin();
+  knob.begin();
+  btns.begin();
+  pixels.begin();
+
+  analogReadResolution(12);
+
+  modeChangeMs = millis();
+  rpcSetModeImmediate(0);
+}
+
+void loop(){
+  uint32_t nowMs = millis();
+
+  // decay burst energy
+  burstA *= 0.92f;
+  burstB *= 0.92f;
+  burstC *= 0.92f;
+  burstK *= 0.90f;
+
+  // --- scan inputs ---
+  if(nowMs - lastInputMs >= 5){
+    lastInputMs = nowMs;
+
+    int pos = knob.get();
+    if(pos < 0 || pos > 100){
+      knob.set(50);
+      pos = 50;
+    }
+    uiDial = pos;
+    uiEnergy = uiDial / 100.0f;
+
+    // Mode change by twist (cinematic)
+    int8_t d = knob.getDirection();
+    if(!inTrans && d != 0 && (nowMs - lastModeStepMs) > 120){
+      lastModeStepMs = nowMs;
+      kickBurst(burstK, 0.35f);
+
+      uint8_t next = (d > 0) ? ((mode + 1) & 3) : ((mode + 3) & 3);
+      startTransitionTo(next);
+    }
+
+    // knob press long = panic
+    gKnob.update(knob.isPressed(), nowMs, onKnobEvt);
+
+    // buttons
+    btns.update();
+    gA.update(btns.isPressed(0), nowMs, onAEvt);
+    gB.update(btns.isPressed(1), nowMs, onBEvt);
+    gC.update(btns.isPressed(2), nowMs, onCEvt);
+
+    updateButtonLeds(nowMs);
+  }
+
+  // --- pots -> M7 ---
+  if(nowMs - lastPotsMs >= 10){
+    lastPotsMs = nowMs;
+
+    a0 = analogRead(A0);
+    a1 = analogRead(A1);
+    a4 = analogRead(A4);
+    a5 = analogRead(A5);
+    a6 = analogRead(A6);
+
+    float t0 = a0 / 4095.0f;
+    float t1 = a1 / 4095.0f;
+    float t2 = a4 / 4095.0f;
+    float t3 = a5 / 4095.0f;
+    float t4 = a6 / 4095.0f;
+
+    p0 = lerpf(p0, t0, 0.15f);
+    p1 = lerpf(p1, t1, 0.15f);
+    p2 = lerpf(p2, t2, 0.15f);
+    p3 = lerpf(p3, t3, 0.15f);
+    p4 = lerpf(p4, t4, 0.15f);
+
+    RPC.call("setPots", (int)a0, (int)a1, (int)a4, (int)a5, (int)a6);
+  }
+
+  // --- spectrum from M7 -> pixels ---
+  if(nowMs - lastBandsMs >= 33){
+    lastBandsMs = nowMs;
+
+    uint32_t packed = 0;
+    auto resp = RPC.call("getBands");
+    packed = resp.as<uint32_t>();
+
+    for(int i=0;i<8;i++){
+      bandRaw[i] = bandAt(packed, i);
+      bandSm[i] = lerpf(bandSm[i], (float)bandRaw[i], 0.30f);
+    }
+
+    updatePixels(nowMs);
+  }
+
+  // --- OLED ---
+  if(nowMs - lastFrameMs >= 33){
+    lastFrameMs = nowMs;
+    if(inTrans) drawTransitionFrame(nowMs);
+    else        drawModeFrame(nowMs);
+  }
+}
