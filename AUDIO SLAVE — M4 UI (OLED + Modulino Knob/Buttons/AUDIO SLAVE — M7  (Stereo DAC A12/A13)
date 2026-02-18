@@ -1,0 +1,614 @@
+#include <Arduino.h>
+#include <RPC.h>
+#include <math.h>
+#include <string.h>
+
+// =====================================================
+// AUDIO SLAVE — M7  (Stereo DAC A12/A13)
+// 4 engines (2 luxurious, 2 wild) + hall reverb
+// RPC:
+//   setMode(int m)
+//   setPots(int a0,int a1,int a4,int a5,int a6)
+//   trigger(int code)
+//   getBands() -> packed 8x4-bit spectrum levels
+// Pots:
+//   A0 pitch (bass range), A1 timbre, A4 motion/decay, A5 width/wet, A6 volume
+// =====================================================
+
+static constexpr float SR = 44100.0f;
+static constexpr uint32_t US_PER = 22; // approx 44.1k loop timing gate
+static constexpr float TWO_PI_F = 6.28318530718f;
+static constexpr float PI_F     = 3.14159265359f;
+
+static inline float clampf(float x, float lo, float hi){ return (x<lo)?lo:(x>hi)?hi:x; }
+static inline float lerpf(float a, float b, float t){ return a + (b-a)*t; }
+
+// ---------- RNG noise ----------
+static uint32_t rng = 0x12345678u;
+static inline uint32_t xrnd(){ rng ^= rng<<13; rng ^= rng>>17; rng ^= rng<<5; return rng; }
+static inline float noise11(){
+  uint32_t r = xrnd() >> 8;
+  float u = (float)r * (1.0f / 16777215.0f);
+  return u * 2.0f - 1.0f;
+}
+
+// ---------- soft clip ----------
+static inline float softClip(float x){
+  float y = x * (1.5f - 0.5f * x * x);
+  return clampf(y, -1.0f, 1.0f);
+}
+
+// ---------- polyBLEP saw ----------
+static inline float polyBlep(float t, float dt){
+  if(t < dt){
+    t /= dt;
+    return t + t - t*t - 1.0f;
+  } else if(t > 1.0f - dt){
+    t = (t - 1.0f) / dt;
+    return t*t + t + t + 1.0f;
+  }
+  return 0.0f;
+}
+static inline float sawBlep(float &ph, float dph){
+  float t = ph;
+  float y = 2.0f*t - 1.0f;
+  y -= polyBlep(t, dph);
+  ph += dph;
+  if(ph >= 1.0f) ph -= 1.0f;
+  return y;
+}
+static inline float sineOsc(float &ph, float dph){
+  float y = sinf(ph * TWO_PI_F);
+  ph += dph;
+  if(ph >= 1.0f) ph -= 1.0f;
+  return y;
+}
+static inline float triFromSaw(float s){ return 2.0f*fabsf(s) - 1.0f; }
+
+// ---------- SVF ----------
+struct SVF {
+  float lp=0, bp=0;
+  float f=0.10f;
+  float q=0.55f; // damping (lower = more resonance)
+  inline void set(float f_, float q_){ f=f_; q=q_; }
+  inline void process(float x, float &outLP, float &outBP, float &outHP){
+    float hp = x - lp - q*bp;
+    bp += f * hp;
+    lp += f * bp;
+    outLP = lp;
+    outBP = bp;
+    outHP = hp;
+  }
+};
+
+// ---------- Real hall reverb ----------
+struct Comb {
+  float *buf=nullptr;
+  int   n=0, idx=0;
+  float fb=0.84f;
+  float damp=0.20f;
+  float lp=0.0f;
+  inline float process(float x){
+    float y = buf[idx];
+    lp = lerpf(y, lp, damp);
+    buf[idx] = x + lp * fb;
+    idx++; if(idx>=n) idx=0;
+    return y;
+  }
+};
+struct Allpass {
+  float *buf=nullptr;
+  int   n=0, idx=0;
+  float g=0.70f;
+  inline float process(float x){
+    float b = buf[idx];
+    float y = -g*x + b;
+    buf[idx] = x + g*y;
+    idx++; if(idx>=n) idx=0;
+    return y;
+  }
+};
+
+// delay buffers (reverb)
+static float cL1b[1116], cL2b[1188], cL3b[1277], cL4b[1356];
+static float cR1b[1139], cR2b[1211], cR3b[1300], cR4b[1379];
+static float aL1b[556],  aL2b[441];
+static float aR1b[579],  aR2b[464];
+
+static Comb    cL[4], cR[4];
+static Allpass aL[2], aR[2];
+
+static inline void reverbInit(){
+  memset(cL1b,0,sizeof(cL1b)); memset(cL2b,0,sizeof(cL2b));
+  memset(cL3b,0,sizeof(cL3b)); memset(cL4b,0,sizeof(cL4b));
+  memset(cR1b,0,sizeof(cR1b)); memset(cR2b,0,sizeof(cR2b));
+  memset(cR3b,0,sizeof(cR3b)); memset(cR4b,0,sizeof(cR4b));
+  memset(aL1b,0,sizeof(aL1b)); memset(aL2b,0,sizeof(aL2b));
+  memset(aR1b,0,sizeof(aR1b)); memset(aR2b,0,sizeof(aR2b));
+
+  cL[0] = {cL1b,1116,0,0.84f,0.20f,0}; cL[1] = {cL2b,1188,0,0.83f,0.22f,0};
+  cL[2] = {cL3b,1277,0,0.82f,0.24f,0}; cL[3] = {cL4b,1356,0,0.81f,0.26f,0};
+
+  cR[0] = {cR1b,1139,0,0.84f,0.20f,0}; cR[1] = {cR2b,1211,0,0.83f,0.22f,0};
+  cR[2] = {cR3b,1300,0,0.82f,0.24f,0}; cR[3] = {cR4b,1379,0,0.81f,0.26f,0};
+
+  aL[0] = {aL1b,556,0,0.72f}; aL[1] = {aL2b,441,0,0.70f};
+  aR[0] = {aR1b,579,0,0.72f}; aR[1] = {aR2b,464,0,0.70f};
+}
+
+static inline void reverbSet(float decay, float damp){
+  float fb = 0.74f + 0.23f * clampf(decay,0.0f,1.0f);
+  float dp = 0.08f + 0.40f * clampf(damp, 0.0f,1.0f);
+
+  cL[0].fb = fb;        cL[1].fb = fb*0.995f; cL[2].fb = fb*0.990f; cL[3].fb = fb*0.985f;
+  cR[0].fb = fb*0.997f; cR[1].fb = fb*0.992f; cR[2].fb = fb*0.987f; cR[3].fb = fb*0.982f;
+
+  for(int i=0;i<4;i++){ cL[i].damp = dp; cR[i].damp = dp; }
+}
+static inline void reverbProcess(float in, float &wetL, float &wetR){
+  float sL = 0, sR = 0;
+  for(int i=0;i<4;i++){ sL += cL[i].process(in); sR += cR[i].process(in); }
+  sL *= 0.25f; sR *= 0.25f;
+
+  sL = aL[0].process(sL); sL = aL[1].process(sL);
+  sR = aR[0].process(sR); sR = aR[1].process(sR);
+
+  wetL = sL;
+  wetR = sR;
+}
+
+// ---------- Spectrum: 8-band envelope ----------
+static float sLP[8]={0}, sBP[8]={0}, sENV[8]={0};
+static float sF[8]={0};
+static constexpr float sQ = 0.80f;
+static uint32_t packedBands = 0;
+
+static inline float bandStep(int i, float x){
+  float hp = x - sLP[i] - sQ*sBP[i];
+  sBP[i] += sF[i]*hp;
+  sLP[i] += sF[i]*sBP[i];
+  return sBP[i];
+}
+static inline uint32_t pack8x4(const uint8_t v[8]){
+  uint32_t p=0;
+  for(int i=0;i<8;i++) p |= ((uint32_t)(v[i]&0x0F)) << (i*4);
+  return p;
+}
+
+// ---------- RPC shared state ----------
+volatile int v_mode = 0;
+volatile float v_p0=0, v_p1=0, v_p2=0, v_p3=0, v_p4=0;
+
+// internal smoothed controls
+static float p0=0,p1=0,p2=0,p3=0,p4=0;
+
+// performance envelopes from buttons
+static float envPunch=0.0f;
+static float envBloom=0.0f;
+static float envSpark=0.0f;
+
+// toggles
+static bool subLatch=false;
+static bool airLatch=false;
+static bool glitchLatch=false;
+
+// ---------- oscillators ----------
+static float phA_L=0, phB_L=0, phC_L=0, phD_L=0;
+static float phA_R=0, phB_R=0, phC_R=0, phD_R=0;
+static float phS_L=0, phS_R=0;
+static float phSub=0;
+static float lfo1=0, lfo2=0;
+
+// filters
+static SVF svfL, svfR;
+static SVF f1L, f2L, f1R, f2R;
+
+// tiny slap delay for mode 3
+static float dlyL[720], dlyR[720];
+static int dlyIdx = 0;
+
+static inline float bassMap(float x){
+  x = clampf(x,0,1);
+  float a = x*x;
+  float hz = 18.0f + a * 202.0f; // 18..220
+  if(x > 0.90f){
+    float t = (x - 0.90f) / 0.10f;
+    hz += t * 140.0f;            // up to ~360
+  }
+  return hz;
+}
+static inline float hzToF(float hz){
+  float fRaw = 2.0f * sinf(PI_F * (hz / SR));
+  return clampf(fRaw, 0.002f, 0.85f);
+}
+
+// ---------- RPC endpoints ----------
+void setMode(int m){ v_mode = m & 3; }
+void setPots(int a0,int a1,int a4,int a5,int a6){
+  float denom = (a6 > 1200 || a5 > 1200 || a4 > 1200) ? 4095.0f : 1023.0f;
+  v_p0 = a0 / denom;
+  v_p1 = a1 / denom;
+  v_p2 = a4 / denom;
+  v_p3 = a5 / denom;
+  v_p4 = a6 / denom;
+}
+void trigger(int code){
+  if(code==0) envPunch = 1.0f;
+  if(code==1) envBloom = 1.0f;
+  if(code==2) envSpark = 1.0f;
+
+  if(code==10) subLatch = !subLatch;
+  if(code==11) airLatch = !airLatch;
+  if(code==12) glitchLatch = !glitchLatch;
+
+  if(code==32){
+    subLatch=airLatch=glitchLatch=false;
+    envPunch=envBloom=envSpark=0.0f;
+  }
+}
+uint32_t getBands(){ return packedBands; }
+
+void setup(){
+  RPC.begin();
+  RPC.bind("setMode",  setMode);
+  RPC.bind("setPots",  setPots);
+  RPC.bind("trigger",  trigger);
+  RPC.bind("getBands", getBands);
+
+  analogWriteResolution(12);
+  randomSeed((uint32_t)micros());
+  reverbInit();
+
+  memset(dlyL,0,sizeof(dlyL));
+  memset(dlyR,0,sizeof(dlyR));
+
+  // analyzer band centers
+  const float fc[8] = { 60, 120, 240, 480, 950, 1900, 3800, 7600 };
+  for(int i=0;i<8;i++){
+    float f = 2.0f * sinf(PI_F * (fc[i] / SR));
+    sF[i] = clampf(f, 0.001f, 1.9f);
+  }
+
+  svfL = {}; svfR = {};
+  f1L = {}; f2L = {}; f1R = {}; f2R = {};
+}
+
+void loop(){
+  static uint32_t lastSample = 0;
+  uint32_t now = micros();
+  if(now - lastSample < US_PER) return;
+  lastSample += US_PER;
+
+  // smooth controls
+  const float sm = 0.004f;
+  p0 += sm*(v_p0 - p0);
+  p1 += sm*(v_p1 - p1);
+  p2 += sm*(v_p2 - p2);
+  p3 += sm*(v_p3 - p3);
+  p4 += sm*(v_p4 - p4);
+
+  // envelopes
+  envPunch *= 0.94f;
+  envBloom *= 0.995f;
+  envSpark *= 0.92f;
+
+  int m = v_mode;
+
+  float pitch = clampf(p0,0,1);
+  float timb  = clampf(p1,0,1);
+  float mot   = clampf(p2,0,1);
+  float wid   = clampf(p3,0,1);
+  float vol   = clampf(p4,0,1);
+
+  float baseHz = bassMap(pitch);
+
+  // LFOs
+  lfo1 += (0.00005f + mot*0.00040f); if(lfo1>=1) lfo1-=1;
+  lfo2 += (0.00004f + mot*0.00032f); if(lfo2>=1) lfo2-=1;
+  float l1 = sinf(lfo1*TWO_PI_F);
+  float l2 = sinf(lfo2*TWO_PI_F);
+
+  float detWide = 0.0012f + 0.030f*(wid*wid);
+  float detWob  = 0.0040f * mot * l1;
+
+  float detL = 1.0f - detWide + detWob;
+  float detR = 1.0f + detWide - detWob;
+
+  float preL=0, preR=0;
+  float driveOut = 1.0f;
+
+  // ==========================================================
+  // 4 engines
+  // ==========================================================
+
+  if(m==0){
+    // LUX #1 — SUB/TRI DREAD PAD (huge, warm, slow)
+    float fL = baseHz * detL;
+    float fR = baseHz * detR;
+
+    float sA_L = sawBlep(phA_L, fL/SR);
+    float sA_R = sawBlep(phA_R, fR/SR);
+
+    float triL = triFromSaw(sA_L);
+    float triR = triFromSaw(sA_R);
+
+    float sinL = sineOsc(phS_L, (fL*0.500f)/SR);
+    float sinR = sineOsc(phS_R, (fR*0.500f)/SR);
+
+    float sub = sinf(phSub * TWO_PI_F);
+    phSub += (baseHz * 0.5f) / SR;
+    if(phSub >= 1.0f) phSub -= 1.0f;
+
+    float subAmt = 0.60f + 0.25f*(subLatch?1.0f:0.0f);
+    float warmth = 0.30f + 0.55f*timb;
+
+    float coreL = triL*0.72f + sinL*0.28f + sub*subAmt;
+    float coreR = triR*0.72f + sinR*0.28f + sub*subAmt;
+
+    float trem = 0.86f + 0.14f*(0.5f + 0.5f*l2);
+    coreL *= trem; coreR *= trem;
+
+    float cutHz = 80.0f + 2200.0f*(timb*timb) + 520.0f*mot;
+    cutHz = clampf(cutHz, 65.0f, 4200.0f);
+    float fSV = clampf(2.0f * sinf(PI_F * (cutHz / SR)), 0.002f, 0.60f);
+    float qSV  = 0.55f;
+
+    svfL.set(fSV, qSV); svfR.set(fSV, qSV);
+    float lpL,bpL,hpL, lpR,bpR,hpR;
+    svfL.process(coreL, lpL, bpL, hpL);
+    svfR.process(coreR, lpR, bpR, hpR);
+
+    float sat = 0.90f + 1.10f*warmth;
+    preL = softClip(lpL * sat);
+    preR = softClip(lpR * sat);
+
+    driveOut = 0.95f;
+
+  } else if(m==1){
+    // CRAZY #1 — FM SHIMMER/METAL
+    float car = baseHz * (0.72f + 0.38f*(1.0f - timb));
+    float ratio = 1.5f + 7.0f*timb;
+    ratio += 0.8f*mot*l1;
+    float modHz = car * ratio;
+
+    float idx = 30.0f + 880.0f*(timb*timb) + 750.0f*envSpark;
+
+    static float phCarL=0, phCarR=0, phModL=0, phModR=0;
+    phModL += modHz / SR; if(phModL>=1) phModL-=1;
+    phModR += (modHz*(1.0f+0.003f*wid)) / SR; if(phModR>=1) phModR-=1;
+
+    float modL = sinf(phModL*TWO_PI_F);
+    float modR = sinf(phModR*TWO_PI_F);
+
+    float incL = (car + modL*idx) / SR;
+    float incR = (car + modR*idx) / SR;
+
+    phCarL += incL; if(phCarL>=1) phCarL-=1;
+    phCarR += incR; if(phCarR>=1) phCarR-=1;
+
+    float fmL = sinf(phCarL*TWO_PI_F);
+    float fmR = sinf(phCarR*TWO_PI_F);
+
+    float air = (airLatch?1.0f:0.0f) * 0.10f * noise11();
+
+    float cutHz = 220.0f + 8200.0f*(timb) + 1800.0f*mot;
+    cutHz = clampf(cutHz, 140.0f, 12000.0f);
+    float fSV  = clampf(2.0f * sinf(PI_F * (cutHz / SR)), 0.002f, 0.85f);
+    float qSV  = 0.35f;
+
+    svfL.set(fSV, qSV); svfR.set(fSV, qSV);
+    float lpL,bpL,hpL, lpR,bpR,hpR;
+    svfL.process(fmL + air, lpL, bpL, hpL);
+    svfR.process(fmR + air, lpR, bpR, hpR);
+
+    preL = softClip((lpL*0.70f + hpL*0.30f) * (1.2f + 0.9f*timb));
+    preR = softClip((lpR*0.70f + hpR*0.30f) * (1.2f + 0.9f*timb));
+
+    driveOut = 0.90f;
+
+  } else if(m==2){
+    // LUX #2 — FORMANT CHOIR/CHANT (vocal-ish + breath + sub)
+    float f0 = baseHz * (0.55f + 0.30f*(1.0f - timb));
+    float fL = f0 * detL;
+    float fR = f0 * detR;
+
+    float sL = sawBlep(phB_L, fL/SR);
+    float sR = sawBlep(phB_R, fR/SR);
+
+    float breath = (0.10f + 0.20f*(airLatch?1.0f:0.0f)) * (0.25f + 0.75f*(1.0f - timb)) * noise11();
+    float srcL = 0.65f*sL + breath;
+    float srcR = 0.65f*sR + breath;
+
+    float vowel = timb;
+    float drift = 0.12f*mot*l2;
+
+    float F1 = lerpf(240.0f,  950.0f, clampf(vowel + drift,0,1));
+    float F2 = lerpf(900.0f, 2600.0f, clampf(vowel*0.85f - drift,0,1));
+
+    float qDamp = 0.20f;
+    f1L.set(hzToF(F1), qDamp); f2L.set(hzToF(F2), qDamp);
+    f1R.set(hzToF(F1), qDamp); f2R.set(hzToF(F2), qDamp);
+
+    float lp,bp,hp;
+    float f1bpL, f2bpL, f1bpR, f2bpR;
+
+    f1L.process(srcL, lp, f1bpL, hp);
+    f2L.process(srcL, lp, f2bpL, hp);
+    f1R.process(srcR, lp, f1bpR, hp);
+    f2R.process(srcR, lp, f2bpR, hp);
+
+    float chantL = (f1bpL*0.95f + f2bpL*0.75f);
+    float chantR = (f1bpR*0.95f + f2bpR*0.75f);
+
+    float sub = sinf(phSub * TWO_PI_F);
+    phSub += (f0 * 0.5f) / SR;
+    if(phSub >= 1.0f) phSub -= 1.0f;
+
+    chantL += sub * (0.38f + 0.18f*(subLatch?1.0f:0.0f));
+    chantR += sub * (0.38f + 0.18f*(subLatch?1.0f:0.0f));
+
+    preL = softClip(chantL * (1.55f + 1.15f*vowel));
+    preR = softClip(chantR * (1.55f + 1.15f*vowel));
+
+    driveOut = 0.92f;
+
+  } else {
+    // CRAZY #2 — SUPERSAW ARENA (wide, slap)
+    float f0 = baseHz * (0.90f + 0.25f*timb);
+    float fL = f0 * detL;
+    float fR = f0 * detR;
+
+    float spread = 0.004f + 0.018f*(wid*wid);
+    float w1 = 1.0f - spread;
+    float w2 = 1.0f + spread;
+    float w3 = 1.0f - 2.2f*spread;
+    float w4 = 1.0f + 2.2f*spread;
+
+    float aL = sawBlep(phA_L, (fL*w1)/SR);
+    float bL = sawBlep(phB_L, (fL*w2)/SR);
+    float cL = sawBlep(phC_L, (fL*w3)/SR);
+    float dL = sawBlep(phD_L, (fL*w4)/SR);
+
+    float aR = sawBlep(phA_R, (fR*w1)/SR);
+    float bR = sawBlep(phB_R, (fR*w2)/SR);
+    float cR = sawBlep(phC_R, (fR*w3)/SR);
+    float dR = sawBlep(phD_R, (fR*w4)/SR);
+
+    float coreL = (aL+bL+cL+dL) * 0.25f;
+    float coreR = (aR+bR+cR+dR) * 0.25f;
+
+    float envOpen = envPunch * 1.2f;
+
+    float cutHz = 140.0f + 5200.0f*timb + 3200.0f*mot + 5200.0f*envOpen;
+    cutHz = clampf(cutHz, 90.0f, 12000.0f);
+    float fSV  = clampf(2.0f * sinf(PI_F * (cutHz / SR)), 0.002f, 0.85f);
+    float qSV  = clampf(0.55f - 0.25f*timb, 0.15f, 0.60f);
+
+    svfL.set(fSV, qSV); svfR.set(fSV, qSV);
+    float lpL,bpL,hpL, lpR,bpR,hpR;
+    svfL.process(coreL, lpL, bpL, hpL);
+    svfR.process(coreR, lpR, bpR, hpR);
+
+    float bite = 0.8f + 2.2f*(timb*timb) + 1.2f*envOpen;
+    float hotL = softClip(lpL * bite);
+    float hotR = softClip(lpR * bite);
+
+    int tap = 520; // ~11.8 ms
+    int read = dlyIdx - tap; if(read < 0) read += 720;
+
+    float slapL = dlyL[read];
+    float slapR = dlyR[read];
+
+    dlyL[dlyIdx] = hotL + slapL*0.28f;
+    dlyR[dlyIdx] = hotR + slapR*0.28f;
+
+    dlyIdx++; if(dlyIdx >= 720) dlyIdx = 0;
+
+    preL = softClip(hotL + slapL*0.55f);
+    preR = softClip(hotR + slapR*0.55f);
+
+    driveOut = 0.88f;
+  }
+
+  // ==========================================================
+  // Reverb per mode
+  // ==========================================================
+  float revWet, revDecay, revDamp;
+  if(m==0){
+    revWet   = 0.34f + 0.38f*wid + 0.22f*envBloom;
+    revDecay = 0.66f + 0.32f*mot;
+    revDamp  = 0.78f;
+  } else if(m==1){
+    revWet   = 0.22f + 0.30f*wid + 0.12f*envBloom;
+    revDecay = 0.48f + 0.28f*mot;
+    revDamp  = 0.32f;
+  } else if(m==2){
+    revWet   = 0.36f + 0.36f*wid + 0.22f*envBloom;
+    revDecay = 0.74f + 0.24f*mot;
+    revDamp  = 0.55f;
+  } else {
+    revWet   = 0.14f + 0.22f*wid + 0.10f*envBloom;
+    revDecay = 0.34f + 0.24f*mot;
+    revDamp  = 0.40f;
+  }
+
+  float wet   = clampf(revWet,   0.0f, 0.80f);
+  float decay = clampf(revDecay, 0.0f, 1.0f);
+  float damp  = clampf(revDamp,  0.0f, 1.0f);
+
+  reverbSet(decay, damp);
+
+  float send = softClip(0.5f*(preL + preR) * 0.85f);
+  float wetL, wetR;
+  reverbProcess(send, wetL, wetR);
+
+  wetL *= (0.90f + 0.10f*(1.0f - wid));
+  wetR *= (0.90f + 0.10f*(1.0f - wid));
+
+  float outL = lerpf(preL, wetL, wet);
+  float outR = lerpf(preR, wetR, wet);
+
+  // volume (A6)
+  float v = vol*vol;
+  outL *= (0.06f + 0.94f*v) * driveOut;
+  outR *= (0.06f + 0.94f*v) * driveOut;
+
+  // ==========================================================
+  // Analyzer (pre-volume)
+  // ==========================================================
+  static float agc = 1.0f;
+  static float floorEnv = 0.0f;
+  static float prog = 0.0f;
+
+  float ana = 0.5f * (preL + preR);
+
+  float absAna = fabsf(ana);
+  floorEnv = lerpf(floorEnv, absAna, 0.0008f);
+
+  if(absAna > prog) prog = absAna;
+  else              prog *= 0.9992f;
+
+  float target = 0.18f;
+  float wantGain = target / (prog + 1e-5f);
+  wantGain = clampf(wantGain, 0.8f, 30.0f);
+  agc = lerpf(agc, wantGain, 0.0015f);
+
+  float x = ana * agc;
+  float floorSub = floorEnv * agc * 0.80f;
+
+  float mag = fabsf(x) - floorSub;
+  if(mag < 0.0f) mag = 0.0f;
+  float driveAna = (x >= 0.0f) ? mag : -mag;
+
+  for(int i=0;i<8;i++){
+    float bp = bandStep(i, driveAna);
+    float e  = fabsf(bp);
+    if(e > sENV[i]) sENV[i] = e;
+    else            sENV[i] *= 0.9968f;
+  }
+
+  uint8_t q[8];
+  for(int i=0;i<8;i++){
+    float vv = sENV[i] * 28.0f;
+    vv = sqrtf(clampf(vv, 0.0f, 8.0f));
+    int n = (int)(vv * 15.0f + 0.5f);
+    if(n < 0) n = 0;
+    if(n > 15) n = 15;
+    if(n > 0 && n < 2) n = 2;
+    q[i] = (uint8_t)n;
+  }
+  packedBands = pack8x4(q);
+
+  // output to DAC
+  outL = clampf(outL, -1.0f, 1.0f);
+  outR = clampf(outR, -1.0f, 1.0f);
+
+  int dacL = (int)((outL * 0.88f + 1.0f) * 2047.5f);
+  int dacR = (int)((outR * 0.88f + 1.0f) * 2047.5f);
+
+  if(dacL < 0) dacL = 0; else if(dacL > 4095) dacL = 4095;
+  if(dacR < 0) dacR = 0; else if(dacR > 4095) dacR = 4095;
+
+  analogWrite(A12, dacL);
+  analogWrite(A13, dacR);
+}
